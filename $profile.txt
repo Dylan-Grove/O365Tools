@@ -1,0 +1,384 @@
+Function New-O365Session{
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ParameterSetName="BasicSession")]
+        [Switch]$Basic,
+
+        [parameter(Mandatory=$true, ParameterSetName="BasicSession")]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [parameter(Mandatory=$true, ParameterSetName="ModernSession")]
+        [Switch]$Modern
+    )
+
+    If($Basic){
+        $Session = New-PSSession -ConfigurationName Microsoft.Exchange -ConnectionUri https://ps.outlook.com/powershell/ -Credential $Credential -Authentication Basic –AllowRedirection
+        Import-PSSession $Session
+        Return $Session
+    }
+    If($Modern){
+        $CreateEXOPSSession = (Get-ChildItem -Path $env:userprofile -Filter CreateExoPSSession.ps1 -Recurse -ErrorAction SilentlyContinue -Force | Select -Last 1).DirectoryName
+        . "$CreateEXOPSSession\CreateExoPSSession.ps1"
+        Connect-EXOPSSession
+    }
+}
+
+
+
+Function Copy-O365GroupMembership{
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true)][String]$SourceGroup,
+        [parameter(Mandatory=$true)][String]$DestinationGroup,
+
+        [ValidateSet("Basic", "Modern")]
+        [String]$Session
+    )
+
+    If($Session -eq "Basic"){New-O365Session -Basic -Credential (Get-Credential "f12admin@")}
+    If($NewSession = "Modern"){ New-O365Session -Modern }
+
+    Get-DistributionGroupMember -Identity $SourceGroup | % {Write-Host -ForegroundColor Yellow "Attempting to add" $_.Name "..." ;Add-DistributionGroupMember -Identity $DestinationGroup -Member $_.PrimarySmtpAddress}
+
+}
+
+
+
+
+Function Disable-O365MobileDevices{
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [String]$Identity,
+        
+        [ValidateSet("Basic", "Modern")]
+        [String]$Session
+    )
+
+    If($Session -eq "Basic"){New-O365Session -Basic -Credential (Get-Credential "f12admin@")}
+    ElseIf($Session -eq "Modern"){New-O365Session -Modern}
+
+    Get-MobileDevice -Mailbox $Identity | Remove-MobileDevice -confirm:$false -Verbose
+    Set-CASMailbox -Identity $Identity -ActiveSyncEnabled $False -Verbose
+}
+
+
+
+
+Function Convert-SharedMailbox{
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [String]$Identity,
+        
+        [ValidateSet("Basic", "Modern")]
+        [String]$Session
+    )
+
+    If($Session -eq "Basic"){New-O365Session -Basic -Credential (Get-Credential "f12admin@")}
+    ElseIf($Session -eq "Modern"){New-O365Session -Modern}
+
+    Set-Mailbox -Identity $Identity -Type shared -verbose
+    sleep 5
+    Get-Mailbox -Identity $Identity | Select name,IsShared
+}
+
+
+
+Function Remove-O365DistributionGroupMembership{
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [String]$Identity,
+        
+        [ValidateSet("Basic", "Modern")]
+        [String]$Session
+    )
+
+    If($Session -eq "Basic"){New-O365Session -Basic -Credential (Get-Credential "f12admin@")}
+    ElseIf($Session -eq "Modern"){New-O365Session -Modern}
+    
+    $DistributionGroups = Get-Distributiongroup -resultsize unlimited
+    $UserDName = (Get-Mailbox $Identity).name
+    ForEach ($Group in $DistributionGroups){
+        if ((Get-Distributiongroupmember $Group.Name | select -expand name) -contains $UserDName){
+            write-host -foregroundcolor yellow "Removing $UserDName from group '$Group'"
+            Remove-DistributionGroupMember -Identity "$Group" -Member "$UserDName" -verbose -Confirm:$False
+        }
+    }
+}
+
+
+
+Function Block-O365Mailbox {
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [String]$Identity,
+
+        [parameter(Mandatory=$true)]
+        [System.Management.Automation.PSCredential]$Credential
+
+    )
+
+    Connect-MsolService -Credential $Credential
+
+    $UserPrincipleName = (Get-Mailbox -Identity $Identity).PrimarySmtpAddress
+    Set-MsolUser -UserPrincipalName $UserPrincipleName -BlockCredential $true
+    Get-MsolUser -UserPrincipalName $UserPrincipleName | select Name,BlockCredential
+
+}
+
+
+
+
+Function Get-O365MailboxLicenses {
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [String]$Identity,
+
+        [parameter(Mandatory=$true)]
+        [System.Management.Automation.PSCredential]$Credential
+        
+    )
+
+    Connect-MsolService -Credential $Credential
+
+    $UserPrincipleName = (Get-Mailbox -Identity $Identity).PrimarySmtpAddress
+    (Get-MsolUser -UserPrincipalName $UserPrincipleName).Licenses | select AccountskuId | ft @{L='Account Licenses';E={$_.AccountSkuID}}
+
+}
+
+
+
+Function Remove-O365MailboxLicenses {
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [String]$Identity,
+
+        [parameter(Mandatory=$true)]
+        [System.Management.Automation.PSCredential]$Credential
+        
+    )
+    
+    New-O365Session -Basic $Credential
+    Connect-MsolService -Credential $Credential
+
+    $UserPrincipleName = (Get-Mailbox -Identity $Identity).PrimarySmtpAddress
+    (get-MsolUser -UserPrincipalName $UserPrincipleName).licenses.AccountSkuId | foreach{
+        Write-host -ForegroundColor Cyan "Removing License: $_"
+        Set-MsolUserLicense -UserPrincipalName $UserPrincipleName -RemoveLicenses $_
+        }
+}
+
+
+
+
+Function Set-O365MailboxForwarding {
+    
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [String]$Identity,
+
+        [parameter(Mandatory=$true)]
+        [String]$ForwardingAddress,
+
+        [ValidateSet("Basic", "Modern")]
+        [String]$Session,
+      
+        [Switch]$DeliverToMailboxAndForward 
+    )
+        
+    If($Session -eq "Basic"){New-O365Session -Basic}
+    ElseIf($Session -eq "Modern"){New-O365Session -Modern}
+
+    Set-Mailbox -Identity $Identity -ForwardingAddress ((Get-Mailbox -Identity $ForwardingAddress).PrimarySMTPAddress) -DeliverToMailboxAndForward $DeliverToMailboxAndForward -Confirm:$false
+    Get-Mailbox -Identity $Identity | Format-List Name,ForwardingAddress,DeliverToMailboxandForward
+}
+
+
+
+Function Disable-O365Mailbox {
+    <#
+       .Synopsis
+       Completely closes down an account when an employee leaves the company.
+       
+       .Description
+       Converts mailbox to a shared mailbox, Removes Distribution Group Membership, Removes mobile devices and disables activesync, Forwards email and, displays mailbox licenses.
+
+       .Parameter Identity
+       Email address or name on mailbox to be disabled
+       
+       .Parameter ForwardingAddress
+       Email address to forward to.
+
+       .Parameter Session
+       Runs the New-O365Session command in either 'Basic' or 'Modern'
+
+       .Example
+       Disable-O365Mailbox -Identity "Jim John"
+
+       .Example
+       Disable-O365Mailbox -Identity "JJohn@company.com" -ForwardingAddress "Tim Thompson" -Session Basic
+    #>
+        
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true, ValueFromPipelineByPropertyName=$true)]
+        [String]$Identity,
+
+        [ValidateSet("Basic", "Modern")]
+        [String]$Session,
+
+        [String]$ForwardingAddress,
+        [System.Management.Automation.PSCredential]$Credential
+
+    )
+
+    If($Session -eq "Basic"){New-O365Session -Basic}
+    ElseIf($Session -eq "Modern"){New-O365Session -Modern}
+   
+    Disable-O365MobileDevices -Identity $Identity
+    Convert-SharedMailbox -Identity $Identity
+    Remove-O365DistributionGroupMembership -Identity $Identity
+    If($ForwardingAddress){Set-O365MailboxForwarding -Identity $Identity -ForwardingAddress $ForwardingAddress}
+
+    Write-Host -ForegroundColor Yellow "Enter admin credentials to gather mailbox licenses or cancel to finish command."
+    Get-O365MailboxLicenses -Identity $Identity -Credential $Credential
+
+}
+
+
+
+
+Function Add-O365BlockedIP{
+    <#
+       .Synopsis
+       Adds an IP Address to the IPBlockList
+       
+       .Description
+       Adds an IP Address to the IPBlockList in that can be found under Exchange Admin Center > Protection > Connection Filter.
+       This is a useful command if you need to block an IP address of a domain that consistently sends spam mail.
+
+       .Parameter IpAddress
+       Format: '192.168.1.1' No Quotation marks. 
+       This is the IP Address of the sender domain you want to block.
+       
+       .Parameter PolicyName
+       Name of the policy that will be appended. Default is "Default"
+
+       .Parameter Session
+       Runs the New-O365Session command in either 'Basic' or 'Modern'
+
+       .Example
+       Add-O365BlockedIP -IpAddress 192.168.244.242
+
+       .Example
+       Add-O365BlockedIP -IpAddress 192.168.244.242 -PolicyName "ConnectionPolicy" -Session Basic
+    #>
+
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true)]
+        $IpAddress,
+       
+        [ValidateSet("Basic", "Modern")]
+        [String]$Session,
+
+        [String]$PolicyName = "Default"
+    )
+
+    If($Session -eq "Basic"){New-O365Session -Basic -Credential (Get-Credential "f12admin@")}
+    ElseIf($Session -eq "Modern"){New-O365Session -Modern}
+    
+    If($IpAddress.FromIP){ $IpAddress = $IpAddress.FromIP }
+
+    $IPblocklist = (Get-HostedConnectionFilterPolicy -Identity $PolicyName).IPBlockList
+    $IPblocklist += $IPAddress
+    Set-HostedConnectionFilterPolicy -Identity $PolicyName -IPBlockList $IPblocklist
+    Get-HostedConnectionFilterPolicy -Identity $PolicyName | select name,Ipblocklist | ft
+}
+
+
+
+
+
+Function Trace-O365Email {
+      <#
+       .Synopsis
+       Searches a mailbox for an email and provides the sender's IP Address.
+       
+       .Description
+       Searches a mailbox for an email and provides the sender's IP Address. 
+       Can be used in conjunction with Add-O365BlockedIP to block a sender quickly.
+
+       To return only the IP Address, wrap the command with (<command>).FromIP
+
+       .Parameter RecipientAddress
+       Email Address of the Recipient.
+       
+       .Parameter SenderAddress
+       Email Address of the Sender.
+       
+       .Parameter Subject
+       Subject of the email, searched with -like operator.
+
+       .Parameter StartDate
+       Starting Day to begin searching emails from. Default 2 weeks from current date (Get-Date.AddDays(-14))
+
+       .Parameter EndDate
+       End day to begin searching emails from. Default is current date.
+
+       .Parameter Session
+       Runs the New-O365Session command in either 'Basic' or 'Modern'
+
+       .Example
+       Trace-O365Email -RecipientAddress "Joe@contoso.com" -SenderAddress "*@Aol.com"
+
+       .Example
+       Trace-O365Email -RecipientAddress "Joe@contoso.com" -SenderAddress "Henry@BigScams.com" -Startdate 02/14/2019 -EndDate 02/17/2019
+
+       .Example
+       Add-O365BlockedIP -IpAddress (Trace-O365Email -RecipientAddress "Joe@contoso.com" -SenderAddress "Henry@BigScams.com")
+    #>
+
+    [CmdletBinding()]
+    Param(
+        [parameter(Mandatory=$true)]
+        [String]$RecipientAddress,
+
+        [String]$SenderAddress = "",
+       
+        [ValidateSet("Basic", "Modern")]
+        [String]$Session,
+
+        [String]$StartDate = (Get-Date).AddDays(-14),
+
+        [String]$EndDate = (Get-Date),
+
+        [String]$Subject
+
+    )
+
+    If($Session -eq "Basic"){New-O365Session -Basic -Credential (Get-Credential "f12admin@")}
+    ElseIf($Session -eq "Modern"){New-O365Session -Modern}
+    
+    $Trace = Get-MessageTrace -RecipientAddress $RecipientAddress -SenderAddress $SenderAddress -StartDate $StartDate -EndDate $EndDate
+    If($Subject){ $Trace = $Trace | Where-Object -Property Subject -Like "*$Subject*" }
+
+    $SenderIPAddress = $Trace | select FromIP,SenderAddress,Subject
+
+    Return $SenderIPAddress
+}
+

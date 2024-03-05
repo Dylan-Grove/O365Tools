@@ -1,0 +1,4 @@
+Get-aduser -filter * -SearchBase "OU=Edmonton,OU=CLIENT_USERS,DC=CML,DC=local" | %{
+    $email = $_.givenName[0]+$_.surname
+    $_ | Set-Aduser -add @{ProxyAddresses="smtp:$email@company.com"}
+}
